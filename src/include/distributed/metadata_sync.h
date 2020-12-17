@@ -50,11 +50,12 @@ extern char * PlacementUpsertCommand(uint64 shardId, uint64 placementId, int sha
 extern void CreateTableMetadataOnWorkers(Oid relationId);
 extern void MarkNodeHasMetadata(const char *nodeName, int32 nodePort, bool hasMetadata);
 extern void MarkNodeMetadataSynced(const char *nodeName, int32 nodePort, bool synced);
-extern MetadataSyncResult SyncMetadataToNodes(void);
+extern BackgroundWorkerHandle * SpawnSyncMetadataToNodes(Oid database, Oid owner);
 extern bool SendOptionalCommandListToWorkerInTransaction(const char *nodeName, int32
 														 nodePort,
 														 const char *nodeUser,
 														 List *commandList);
+extern int SyncMetadataToNodesMain(Datum main_arg);
 
 #define DELETE_ALL_NODES "TRUNCATE pg_dist_node CASCADE"
 #define REMOVE_ALL_CLUSTERED_TABLES_COMMAND \

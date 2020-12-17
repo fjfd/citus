@@ -28,6 +28,7 @@
 #include "catalog/pg_foreign_server.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
+#include "commands/async.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/commands.h"
 #include "distributed/deparser.h"
@@ -35,6 +36,7 @@
 #include "distributed/listutils.h"
 #include "distributed/metadata_utility.h"
 #include "distributed/coordinator_protocol.h"
+#include "distributed/maintenanced.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/metadata_sync.h"
 #include "distributed/metadata/distobject.h"
@@ -48,11 +50,15 @@
 #include "foreign/foreign.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
+#include "pgstat.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/postmaster.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 
@@ -1497,7 +1503,7 @@ DetachPartitionCommandList(void)
  * metadata workers that are out of sync. Returns the result of
  * synchronization.
  */
-MetadataSyncResult
+static MetadataSyncResult
 SyncMetadataToNodes(void)
 {
 	MetadataSyncResult result = METADATA_SYNC_SUCCESS;
@@ -1538,4 +1544,106 @@ SyncMetadataToNodes(void)
 	}
 
 	return result;
+}
+
+
+/*
+ * SyncMetadataToNodesMain is the main function for syncing metadata to
+ * MX nodes. It retries until success and then exits.
+ */
+int
+SyncMetadataToNodesMain(Datum main_arg)
+{
+	Oid databaseOid = DatumGetObjectId(main_arg);
+
+	/* extension owner is passed via bgw_extra */
+	Oid extensionOwner = InvalidOid;
+	memcpy_s(&extensionOwner, sizeof(extensionOwner),
+			 MyBgworkerEntry->bgw_extra, sizeof(Oid));
+
+	/* connect to database, after that we can actually access catalogs */
+	BackgroundWorkerInitializeConnectionByOid(databaseOid, extensionOwner, 0);
+
+	/* make worker recognizable in pg_stat_activity */
+	pgstat_report_appname("Citus Metadata Sync Daemon");
+
+	bool syncedAllNodes = false;
+
+	InvalidateMetadataSystemCache();
+	StartTransactionCommand();
+
+	/*
+	 * Some functions in ruleutils.c, which we use to get the DDL for
+	 * metadata propagation, require an active snapshot.
+	 */
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (!LockCitusExtension())
+	{
+		ereport(DEBUG1, (errmsg("could not lock the citus extension, "
+								"skipping metadata sync")));
+	}
+	else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+	{
+		MetadataSyncResult result = SyncMetadataToNodes();
+
+		syncedAllNodes = (result == METADATA_SYNC_SUCCESS);
+
+		/*
+		 * Notification means we had an attempt on synchronization
+		 * without being blocked for pg_dist_node access.
+		 */
+		if (result != METADATA_SYNC_FAILED_LOCK)
+		{
+			Async_Notify(METADATA_SYNC_CHANNEL, NULL);
+		}
+	}
+
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+	ProcessCompletedNotifies();
+
+	if (syncedAllNodes)
+	{
+		return 0;
+	}
+
+	return 1;
+}
+
+
+/*
+ * SpawnSyncMetadataToNodes starts a background worker which runs metadata
+ * sync. On success it returns workers' handle. Otherwise it returns NULL.
+ */
+BackgroundWorkerHandle *
+SpawnSyncMetadataToNodes(Oid database, Oid extensionOwner)
+{
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle = NULL;
+
+	/* Configure a worker. */
+	memset(&worker, 0, sizeof(worker));
+	SafeSnprintf(worker.bgw_name, sizeof(worker.bgw_name),
+				 "Citus Metadata Sync: %u/%u",
+				 database, extensionOwner);
+	worker.bgw_flags =
+		BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time = (MetadataSyncRetryInterval + 999) / 1000;
+	strcpy_s(worker.bgw_library_name, sizeof(worker.bgw_library_name), "citus");
+	strcpy_s(worker.bgw_function_name, sizeof(worker.bgw_library_name),
+			 "SyncMetadataToNodesMain");
+	worker.bgw_main_arg = ObjectIdGetDatum(MyDatabaseId);
+	memcpy_s(worker.bgw_extra, sizeof(worker.bgw_extra), &extensionOwner,
+			 sizeof(Oid));
+	worker.bgw_notify_pid = MyProcPid;
+
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+	{
+		return NULL;
+	}
+
+	return handle;
 }

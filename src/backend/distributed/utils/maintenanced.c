@@ -118,7 +118,6 @@ static size_t MaintenanceDaemonShmemSize(void);
 static void MaintenanceDaemonShmemInit(void);
 static void MaintenanceDaemonShmemExit(int code, Datum arg);
 static void MaintenanceDaemonErrorContext(void *arg);
-static bool LockCitusExtension(void);
 static bool MetadataSyncTriggeredCheckAndReset(MaintenanceDaemonDBData *dbData);
 static void WarnMaintenanceDaemonNotStarted(void);
 
@@ -291,6 +290,13 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 	TimestampTz lastRecoveryTime = 0;
 	TimestampTz nextMetadataSyncTime = 0;
 
+
+	/*
+	 * We do metadata sync in a separate background worker. We need its
+	 * handle to be able to check its status.
+	 */
+	BackgroundWorkerHandle *metadataSyncBgwHandle = NULL;
+
 	/*
 	 * Look up this worker's configuration.
 	 */
@@ -450,46 +456,32 @@ CitusMaintenanceDaemonMain(Datum main_arg)
 		}
 #endif
 
+		pid_t metadataSyncBgwPid = 0;
+		BgwHandleStatus metadataSyncStatus =
+			metadataSyncBgwHandle != NULL ?
+			GetBackgroundWorkerPid(metadataSyncBgwHandle, &metadataSyncBgwPid) :
+			BGWH_STOPPED;
+
+
+		/*
+		 * We spawn a metadata sync daemon if it is not already running, and
+		 * either a backend has requested to start it or its timeout has
+		 * passed.
+		 */
 		if (!RecoveryInProgress() &&
+			metadataSyncStatus == BGWH_STOPPED &&
 			(MetadataSyncTriggeredCheckAndReset(myDbData) ||
 			 GetCurrentTimestamp() >= nextMetadataSyncTime))
 		{
-			bool metadataSyncFailed = false;
-
-			InvalidateMetadataSystemCache();
-			StartTransactionCommand();
+			metadataSyncBgwHandle = SpawnSyncMetadataToNodes(MyDatabaseId,
+															 myDbData->userOid);
 
 			/*
-			 * Some functions in ruleutils.c, which we use to get the DDL for
-			 * metadata propagation, require an active snapshot.
+			 * If spawning failed, retry in MetadataSyncRetryInterval,
+			 * otherwise retry in MetadataSyncInterval.
 			 */
-			PushActiveSnapshot(GetTransactionSnapshot());
-
-			if (!LockCitusExtension())
-			{
-				ereport(DEBUG1, (errmsg("could not lock the citus extension, "
-										"skipping metadata sync")));
-			}
-			else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
-			{
-				MetadataSyncResult result = SyncMetadataToNodes();
-				metadataSyncFailed = (result != METADATA_SYNC_SUCCESS);
-
-				/*
-				 * Notification means we had an attempt on synchronization
-				 * without being blocked for pg_dist_node access.
-				 */
-				if (result != METADATA_SYNC_FAILED_LOCK)
-				{
-					Async_Notify(METADATA_SYNC_CHANNEL, NULL);
-				}
-			}
-
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-			ProcessCompletedNotifies();
-
-			int64 nextTimeout = metadataSyncFailed ? MetadataSyncRetryInterval :
+			int64 nextTimeout = metadataSyncBgwHandle == NULL ?
+								MetadataSyncRetryInterval :
 								MetadataSyncInterval;
 			nextMetadataSyncTime =
 				TimestampTzPlusMilliseconds(GetCurrentTimestamp(), nextTimeout);
@@ -786,7 +778,7 @@ MaintenanceDaemonErrorContext(void *arg)
  * LockCitusExtension acquires a lock on the Citus extension or returns
  * false if the extension does not exist or is being dropped.
  */
-static bool
+bool
 LockCitusExtension(void)
 {
 	Oid extensionOid = get_extension_oid("citus", true);

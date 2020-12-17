@@ -94,21 +94,11 @@ step "s2-commit-on-worker"
 
 session "s3"
 
-step "s3-begin"
-{
-  BEGIN;
-}
-
 step "s3-invalidate-metadata-and-resync"
 {
     update pg_dist_node SET metadatasynced = false;
     SELECT trigger_metadata_sync();
     SELECT pg_sleep(1);
-}
-
-step "s3-commit"
-{
-  COMMIT;
 }
 
 permutation "enable-deadlock-detection" "reload-conf" "s2-start-session-level-connection" "s1-begin" "s1-update-1" "s2-begin-on-worker" "s2-update-2-on-worker" "s2-truncate-on-worker" "s3-invalidate-metadata-and-resync" "s2-update-1-on-worker" "s1-update-2" "s1-commit" "s2-commit-on-worker" "disable-deadlock-detection" "reload-conf"

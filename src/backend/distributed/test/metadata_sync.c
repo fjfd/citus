@@ -129,19 +129,12 @@ wait_until_metadata_sync(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * trigger_metadata_sync triggers metadata sync for testing.
+ */
 Datum
 trigger_metadata_sync(PG_FUNCTION_ARGS)
 {
 	TriggerMetadataSync(MyDatabaseId);
 	PG_RETURN_VOID();
-}
-
-
-/*
- * sync_metadata_to_nodes calls SyncMetadataToNodes for testing purposes.
- */
-Datum
-sync_metadata_to_nodes(PG_FUNCTION_ARGS)
-{
-	PG_RETURN_INT32(SyncMetadataToNodes());
 }

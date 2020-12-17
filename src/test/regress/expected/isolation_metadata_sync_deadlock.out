@@ -60,13 +60,12 @@ step s2-update-1-on-worker:
 step s1-update-2:
   UPDATE deadlock_detection_test SET some_val = 1 WHERE user_id = 2;
  <waiting ...>
-isolationtester: canceling step s1-update-2 after 5 seconds
 step s1-update-2: <... completed>
 step s2-update-1-on-worker: <... completed>
 run_commands_on_session_level_connection_to_node
 
 
-error in steps s1-update-2 s2-update-1-on-worker: ERROR:  canceling statement due to user request
+error in steps s1-update-2 s2-update-1-on-worker: ERROR:  canceling the transaction since it was involved in a distributed deadlock
 step s1-commit:
   COMMIT;
 
@@ -85,5 +84,3 @@ step reload-conf:
 pg_reload_conf
 
 t
-unused step name: s3-begin
-unused step name: s3-commit
