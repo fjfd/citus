@@ -55,7 +55,7 @@ extern bool SendOptionalCommandListToWorkerInTransaction(const char *nodeName, i
 														 nodePort,
 														 const char *nodeUser,
 														 List *commandList);
-extern int SyncMetadataToNodesMain(Datum main_arg);
+extern void SyncMetadataToNodesMain(Datum main_arg);
 
 #define DELETE_ALL_NODES "TRUNCATE pg_dist_node CASCADE"
 #define REMOVE_ALL_CLUSTERED_TABLES_COMMAND \

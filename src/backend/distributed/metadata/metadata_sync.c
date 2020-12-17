@@ -1551,7 +1551,7 @@ SyncMetadataToNodes(void)
  * SyncMetadataToNodesMain is the main function for syncing metadata to
  * MX nodes. It retries until success and then exits.
  */
-int
+void
 SyncMetadataToNodesMain(Datum main_arg)
 {
 	Oid databaseOid = DatumGetObjectId(main_arg);
@@ -1575,46 +1575,46 @@ SyncMetadataToNodesMain(Datum main_arg)
 
 	bool syncedAllNodes = false;
 
-	InvalidateMetadataSystemCache();
-	StartTransactionCommand();
-
-	/*
-	 * Some functions in ruleutils.c, which we use to get the DDL for
-	 * metadata propagation, require an active snapshot.
-	 */
-	PushActiveSnapshot(GetTransactionSnapshot());
-
-	if (!LockCitusExtension())
+	while (!syncedAllNodes)
 	{
-		ereport(DEBUG1, (errmsg("could not lock the citus extension, "
-								"skipping metadata sync")));
-	}
-	else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
-	{
-		MetadataSyncResult result = SyncMetadataToNodes();
-
-		syncedAllNodes = (result == METADATA_SYNC_SUCCESS);
+		InvalidateMetadataSystemCache();
+		StartTransactionCommand();
 
 		/*
-		 * Notification means we had an attempt on synchronization
-		 * without being blocked for pg_dist_node access.
+		 * Some functions in ruleutils.c, which we use to get the DDL for
+		 * metadata propagation, require an active snapshot.
 		 */
-		if (result != METADATA_SYNC_FAILED_LOCK)
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		if (!LockCitusExtension())
 		{
-			Async_Notify(METADATA_SYNC_CHANNEL, NULL);
+			ereport(DEBUG1, (errmsg("could not lock the citus extension, "
+									"skipping metadata sync")));
 		}
+		else if (CheckCitusVersion(DEBUG1) && CitusHasBeenLoaded())
+		{
+			MetadataSyncResult result = SyncMetadataToNodes();
+
+			syncedAllNodes = (result == METADATA_SYNC_SUCCESS);
+
+			/* we use LISTEN/NOTIFY to wait for metadata syncing in tests */
+			if (result != METADATA_SYNC_FAILED_LOCK)
+			{
+				Async_Notify(METADATA_SYNC_CHANNEL, NULL);
+			}
+		}
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		ProcessCompletedNotifies();
+
+		if (syncedAllNodes)
+		{
+			break;
+		}
+
+		pg_usleep(MetadataSyncRetryInterval * 1000);
 	}
-
-
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	ProcessCompletedNotifies();
-
-	/*
-	 * If synced all nodes, we are done. Otherwise return 1 so postgres restarts
-	 * the worker in few seconds.
-	 */
-	return syncedAllNodes ? 0 : 1;
 }
 
 
@@ -1628,6 +1628,12 @@ SpawnSyncMetadataToNodes(Oid database, Oid extensionOwner)
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *handle = NULL;
 
+	/*
+	 * If exits because of errors, retry after
+	 * ceil(MetadataSyncRetryInterval / 1000) seconds.
+	 */
+	int retryIntervalSeconds = (MetadataSyncRetryInterval + 999) / 1000;
+
 	/* Configure a worker. */
 	memset(&worker, 0, sizeof(worker));
 	SafeSnprintf(worker.bgw_name, sizeof(worker.bgw_name),
@@ -1636,7 +1642,7 @@ SpawnSyncMetadataToNodes(Oid database, Oid extensionOwner)
 	worker.bgw_flags =
 		BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time = BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time = (MetadataSyncRetryInterval + 999) / 1000;
+	worker.bgw_restart_time = retryIntervalSeconds;
 	strcpy_s(worker.bgw_library_name, sizeof(worker.bgw_library_name), "citus");
 	strcpy_s(worker.bgw_function_name, sizeof(worker.bgw_library_name),
 			 "SyncMetadataToNodesMain");
