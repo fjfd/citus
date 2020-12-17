@@ -1561,6 +1561,12 @@ SyncMetadataToNodesMain(Datum main_arg)
 	memcpy_s(&extensionOwner, sizeof(extensionOwner),
 			 MyBgworkerEntry->bgw_extra, sizeof(Oid));
 
+	/*
+	 * Unblock singals so the daemon is aborted on SIGTERM. Otherwise this
+	 * can block and fail DROP DATABASE/EXTENSION.
+	 */
+	BackgroundWorkerUnblockSignals();
+
 	/* connect to database, after that we can actually access catalogs */
 	BackgroundWorkerInitializeConnectionByOid(databaseOid, extensionOwner, 0);
 
@@ -1604,12 +1610,11 @@ SyncMetadataToNodesMain(Datum main_arg)
 	CommitTransactionCommand();
 	ProcessCompletedNotifies();
 
-	if (syncedAllNodes)
-	{
-		return 0;
-	}
-
-	return 1;
+	/*
+	 * If synced all nodes, we are done. Otherwise return 1 so postgres restarts
+	 * the worker in few seconds.
+	 */
+	return syncedAllNodes ? 0 : 1;
 }
 
 
